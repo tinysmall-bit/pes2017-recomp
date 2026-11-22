@@ -42,7 +42,7 @@ them as unset whatever the environment says, and also drops the keys `F7`, `F10`
 |---|---|
 | `PES17_TRACE_INDIRECT` | CMake option, on by default: reports an indirect call with no recompiled target instead of jumping to null |
 | `PES17_TRACE_FILES=1` | every file opened, read and written. The files asked for and not found are listed at exit regardless |
-| `PES17_TRACE_CAREER=1` | every saved game's package mounted, and every open, read, write, rename, flush, close and truncate inside one, with sizes, offsets and the guest address that asked ([career](../tools/career/README.md)). Off, every hook is one cached branch. Android: the app sets it while `files/career_trace` exists |
+| `PES17_TRACE_CAREER=1` | every saved game's package mounted, and every open, read, write, rename, flush, close and truncate inside one, with sizes, offsets and the guest address that asked ([career](../tools/career/README.md)). Off, every hook is one cached branch. Android: the app sets it while `career_trace` exists in either of its folders — `adb shell "echo 1 > /sdcard/Android/data/com.pes2017.recomp/files/career_trace"` works on a release build, where `run-as` does not |
 | `PES17_TRACE_XMA=1` | every XMA decoder kick with its buffers, and FFmpeg's log |
 | `PES17_DUMP=<hex>[:words][,...]` | blocks of guest memory to print when the watchdog fires (16 words by default) |
 | `PES17_WATCH=<hex>[:bytes]` | a write watchpoint (Linux): the page is made read-only, and every guest write into the range is reported with its call stack and thread, up to `PES17_WATCH_REPORTS` (20); the command processor's writes there are reported too. It logs when it gives up on a busy page |

@@ -218,10 +218,12 @@ streaming its own data.
 | where | how |
 |---|---|
 | desktop | `PES17_TRACE_CAREER=1 ./build/pes17 …`, or the line `PES17_TRACE_CAREER=1` in the `.env` beside the executable |
-| Android | `adb shell run-as com.pes2017.recomp touch files/career_trace` before starting the game; delete the file to stop. The app passes that file's existence in as the switch, so a trace run needs no rebuild |
+| Android | create `files/career_trace` in the app's external folder before starting the game: `adb shell "echo 1 > /sdcard/Android/data/com.pes2017.recomp/files/career_trace"`; `rm` it to stop. A debug build also accepts `adb shell run-as com.pes2017.recomp touch files/career_trace`. The app passes the file's existence in as the switch, so a trace run needs no rebuild — and the external path is the one that works on a release apk, where `run-as` refuses |
 
-The lines go to the ordinary log: `PES17_LOG_FILE=<path>` on desktop, the app's
-own log screen (and logcat) on Android. They are written as they come and are not
+The lines go to the ordinary log: `PES17_LOG_FILE=<path>` on desktop; on Android the
+game's log is `files/game.log` in the app's internal folder, a second copy of it is
+kept in the external one (`…/files/game.log`, which is the one `adb pull` can reach
+without `run-as`), and logcat has it too. Lines are written as they come and are not
 folded into the log's repeat counts — a trace whose lines differ only in their
 offsets is exactly what that folding would destroy. `PES17_LOG_ALL` is not needed.
 
@@ -316,23 +318,25 @@ mkdir -p reports/career/e1
 adb pull /sdcard/Android/data/$P/files/saves reports/career/e1/saves-before
 python3 tools/career/save_probe.py list reports/career/e1/saves-before
 
-# 2. switch the trace on without a rebuild, and drop the previous log
-adb shell run-as $P touch files/career_trace
-adb shell run-as $P rm -f files/game.log
+# 2. switch the trace on without a rebuild, and drop the previous log. The external
+#    folder is used because a release apk is not debuggable, so run-as cannot reach the
+#    internal one. (Debug builds: run-as $P touch files/career_trace.)
+adb shell "echo 1 > /sdcard/Android/data/$P/files/career_trace"
+adb shell "rm -f /sdcard/Android/data/$P/files/game.log"
 
 # 3. start the game. Go straight to Master League > Load, open a career, back out to the
 #    menu, and stop the game. Nothing else — the first mount line should be that career.
 
 # 4. the log, and the answer
-adb shell run-as $P cat files/game.log > reports/career/e1/master-league.log
+adb pull /sdcard/Android/data/$P/files/game.log reports/career/e1/master-league.log
 python3 tools/career/trace_report.py reports/career/e1/master-league.log
 #    if game.log came back empty, the lines are on logcat instead:
 adb logcat -d | python3 tools/career/trace_report.py -
 
 # 5. the same for Become a Legend
-adb shell run-as $P rm -f files/game.log
+adb shell "rm -f /sdcard/Android/data/$P/files/game.log"
 #    ... Become a Legend > Load, open a career, back out, stop ...
-adb shell run-as $P cat files/game.log > reports/career/e1/become-a-legend.log
+adb pull /sdcard/Android/data/$P/files/game.log reports/career/e1/become-a-legend.log
 python3 tools/career/trace_report.py --timeline reports/career/e1/*.log
 ```
 

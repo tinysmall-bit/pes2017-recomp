@@ -747,13 +747,14 @@ class GameActivity : AppCompatActivity(), NativeListener {
         }
         NativeBridge.nativeSetOption("PES17_STUTTERS", "1")
         // A trace of what the game does to its saved games (runtime/kernel/career_trace.h,
-        // tools/career/README.md). On while files/career_trace exists, so a trace run needs
-        // neither a rebuild nor a field for arbitrary switches:
-        //   adb shell run-as com.pes2017.recomp touch files/career_trace
-        NativeBridge.nativeSetOption(
-            "PES17_TRACE_CAREER",
-            if (File(filesDir, "career_trace").exists()) "1" else ""
-        )
+        // tools/career/README.md). On while a career_trace file exists in either of the app's
+        // two folders, so a trace run needs neither a rebuild nor a field for arbitrary
+        // switches. The external one matters: a release apk is not debuggable, so run-as
+        // cannot reach the internal folder on the build a player actually installed.
+        //   adb shell "echo 1 > /sdcard/Android/data/com.pes2017.recomp/files/career_trace"
+        val careerTrace = File(filesDir, "career_trace").exists() ||
+            getExternalFilesDir(null)?.let { File(it, "career_trace").exists() } == true
+        NativeBridge.nativeSetOption("PES17_TRACE_CAREER", if (careerTrace) "1" else "")
         NativeBridge.nativeSetOption("PES17_BLACK_GUARD", if (prefs.blackGuard) "1" else "")
         // Settings > Experiments. Unset when off, so the runtime's own default for the phone applies.
         NativeBridge.nativeSetOption("PES17_ARENA_MB", if (prefs.arenaMB > 0) prefs.arenaMB.toString() else "")
