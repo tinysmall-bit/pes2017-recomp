@@ -75,8 +75,10 @@ jobs:
       # (android/app/build.gradle.kts), so another region's dump would build an
       # APK that refuses the player's own disc.
       EXPECTED_XEX_SHA: b914ec9a1abb3a9b42a64255b6aa8ff27312da126f7c18f8c880106b832779e6
-      # Free space the job insists on; see "Check disk space" below.
-      MIN_FREE_GIB: '30'
+      # Free space the job insists on; see "Check disk space" below. The xex
+      # and its PE image are ~31 MB each, but the generated C++, its objects and
+      # libpes17.so are not, and running out of disk late costs the whole run.
+      MIN_FREE_GIB: '25'
       PROFILE: balanced
       CCACHE_MAXSIZE: 2G
 
@@ -213,9 +215,12 @@ jobs:
             || fail "The download failed. Check that the Dropbox link still works and ends in ?dl=1."
           mv "$xex.part" "$xex"
 
+          # The retail executable itself is small (the Europe dump is ~31 MB);
+          # the 6.5 GB is the disc's other files. This only rejects an empty or
+          # short error page -- the magic and the hash below do the real check.
           size=$(wc -c < "$xex")
           echo "downloaded: $size bytes"
-          [ "$size" -gt 50000000 ] || fail "The download is only $size bytes -- that is not default.xex."
+          [ "$size" -gt 1000000 ] || fail "The download is only $size bytes -- that is not default.xex."
 
           magic=$(head -c 4 "$xex" || true)
           [ "$magic" = XEX2 ] || fail \
