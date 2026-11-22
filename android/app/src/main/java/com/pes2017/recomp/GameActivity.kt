@@ -746,6 +746,14 @@ class GameActivity : AppCompatActivity(), NativeListener {
             NativeBridge.nativeSetOption("PES17_SCALE", prefs.renderScale.toString())
         }
         NativeBridge.nativeSetOption("PES17_STUTTERS", "1")
+        // A trace of what the game does to its saved games (runtime/kernel/career_trace.h,
+        // tools/career/README.md). On while files/career_trace exists, so a trace run needs
+        // neither a rebuild nor a field for arbitrary switches:
+        //   adb shell run-as com.pes2017.recomp touch files/career_trace
+        NativeBridge.nativeSetOption(
+            "PES17_TRACE_CAREER",
+            if (File(filesDir, "career_trace").exists()) "1" else ""
+        )
         NativeBridge.nativeSetOption("PES17_BLACK_GUARD", if (prefs.blackGuard) "1" else "")
         // Settings > Experiments. Unset when off, so the runtime's own default for the phone applies.
         NativeBridge.nativeSetOption("PES17_ARENA_MB", if (prefs.arenaMB > 0) prefs.arenaMB.toString() else "")

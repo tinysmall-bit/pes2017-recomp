@@ -22,6 +22,9 @@
 #include "../guest.h"
 #include "../log.h"
 #include "../env.h"
+#include "../crash.h"
+#include "career_trace.h"
+#include "guest_stack.h"
 
 #include <cstdlib>
 #include <cctype>
@@ -111,6 +114,16 @@ namespace
         {
             LOGK("content: kept the previous %s as %s", package.filename().string().c_str(),
                  backup.filename().string().c_str());
+            if (career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Rotate;
+                event.path = package.string();
+                event.to = backup.string();
+                event.note = "the previous save is whole under the .bak name";
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
+            }
             return;
         }
 
@@ -119,6 +132,15 @@ namespace
              package.string().c_str(), ec.message().c_str());
         ec.clear();
         fs::remove_all(package, ec);
+        if (career_trace::On())
+        {
+            career_trace::Event event;
+            event.op = career_trace::Op::Rotate;
+            event.path = package.string();
+            event.note = "no backup could be kept; the package was emptied in place";
+            event.thread = crash::CurrentThreadName();
+            career_trace::Emit(event);
+        }
     }
 }
 
@@ -192,6 +214,8 @@ PPC_FUNC(__imp__XamContentCreateEx)
     const uint32_t licenseOut  = ctx.r8.u32;
     const uint32_t overlapped  = kernel::StackArgument(ctx, 8);
 
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
     const std::string drive = GuestString(rootName, 32);
     const std::string file  = SafeName(GuestString(contentData + kContentFileName, kContentFileMax));
     if (drive.empty() || file.empty() || !contentData)
@@ -257,6 +281,24 @@ PPC_FUNC(__imp__XamContentCreateEx)
              package.string().c_str(), result);
     }
 
+    // Which package this menu action touched -- the fact the career work is
+    // built on, and the one thing about a save that can be recorded without
+    // knowing anything about its contents.
+    if (career_trace::On())
+    {
+        career_trace::Event event;
+        event.op = career_trace::Op::Mount;
+        event.path = drive;
+        event.to = package.string();
+        event.flags = flags;
+        event.status = result;
+        event.note = !result ? (!existed ? "new" : clear ? "emptied" : "existing")
+                             : "refused";
+        event.stack = site;
+        event.thread = crash::CurrentThreadName();
+        career_trace::Emit(event);
+    }
+
     // XCONTENT_NEW / XCONTENT_EXISTING, and a licence mask of nothing, which is
     // what a package made on this console rather than bought carries.
     if (auto* d = GuestPtr<be32>(dispositionOut)) *d = existed ? 2u : 1u;
@@ -269,6 +311,15 @@ PPC_FUNC(__imp__XamContentClose)
 {
     const std::string drive = GuestString(ctx.r3.u32, 32);
     if (!drive.empty()) UnmountDevice(drive);
+    if (!drive.empty() && career_trace::On())
+    {
+        career_trace::Event event;
+        event.op = career_trace::Op::Unmount;
+        event.path = drive;
+        event.stack = CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr));
+        event.thread = crash::CurrentThreadName();
+        career_trace::Emit(event);
+    }
     CompleteOverlapped(ctx.r4.u32, X_ERROR_SUCCESS);
     ctx.r3.u64 = X_ERROR_SUCCESS;
 }
@@ -296,6 +347,18 @@ PPC_FUNC(__imp__XamContentDelete)
                 backup += ".bak";
                 fs::remove_all(backup, also);
                 LOGK("content: deleted %s", package.string().c_str());
+            }
+            if (career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Delete;
+                event.path = package.string();
+                event.note = result ? "the package could not be removed"
+                                    : "package, and its .bak with it";
+                event.status = result;
+                event.stack = CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr));
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
             }
         }
     }

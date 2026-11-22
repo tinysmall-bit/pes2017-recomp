@@ -110,6 +110,17 @@ if(NOT WIN32)
     add_test(NAME texture-store COMMAND texture-store-test)
 endif()
 
+# ---- the career trace -------------------------------------------------------
+# PES17_TRACE_CAREER's lines (runtime/kernel/career_trace.cpp): the switch reads
+# the environment the way env::Flag does, and the field order and op names are
+# the contract anything reading the log depends on. The sink is where a check
+# reads what a run would have written, so no guest, save or device is needed.
+add_executable(career-trace-test
+    "${CMAKE_CURRENT_SOURCE_DIR}/career_trace_test.cpp"
+    "${PES17_RUNTIME}/kernel/career_trace.cpp")
+target_include_directories(career-trace-test PRIVATE "${PES17_RUNTIME}")
+add_test(NAME career-trace COMMAND career-trace-test)
+
 if(WIN32)
     # The same rule the game is linked with: no C++ runtime beside the
     # executable. Without it a check that pulls in one more libstdc++ symbol
@@ -121,6 +132,7 @@ if(WIN32)
     target_link_options(bc-test PRIVATE -static)
     target_link_options(volume-test PRIVATE -static)
     target_link_options(version-test PRIVATE -static)
+    target_link_options(career-trace-test PRIVATE -static)
 endif()
 
 # ---- the dynamic scene scale -------------------------------------------------

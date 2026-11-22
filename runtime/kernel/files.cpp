@@ -17,6 +17,8 @@
 #include "../log.h"
 #include "../crash.h"
 #include "../stream_trace.h"
+#include "career_trace.h"
+#include "guest_stack.h"
 
 #include <algorithm>
 #include <cctype>
@@ -75,7 +77,16 @@ namespace
         bool isDirectory = false;
         bool writable = false;
         bool deleteOnClose = false;
+        // Under a content package rather than on the disc, and the path the
+        // guest asked for. Only kept while the career trace is on: what a save
+        // trace is about is the two together, and nothing else reads them.
+        bool mounted = false;
+        std::string guestPath;
         std::mutex lock;
+
+        // `handle` below is the C library's stream, so the handle the guest was
+        // given is the one the object layer keeps.
+        uint32_t GuestHandle() const { return Object::handle; }
 
         const char* TypeName() const override { return "file"; }
         ~FileObject() override
@@ -86,6 +97,22 @@ namespace
             // it puts the bytes on storage before the title is told the handle
             // has gone. Pointless for one that is about to be deleted.
             if (handle && writable && !deleteOnClose) kernel::SyncStream(handle);
+            // The one place a save file's handle is known to be gone: NT closes by
+            // releasing the last one, which is this. There is no guest context
+            // here -- the close comes from whoever dropped it -- so no stack.
+            if (mounted && career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Close;
+                event.path = guestPath.empty() ? path.string() : guestPath;
+                event.to = path.string();
+                event.size = size;
+                event.handle = GuestHandle();
+                event.note = writable ? (deleteOnClose ? "writable, delete on close" : "writable")
+                                      : "read-only";
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
+            }
             if (handle) std::fclose(handle);
             // NT has no delete call of its own: a caller marks the file and the
             // deletion happens when the last handle goes.
@@ -245,7 +272,8 @@ namespace
 
     uint32_t OpenFileCommon(const std::string& guestPath, uint32_t desiredAccess,
                             uint32_t disposition, uint32_t options,
-                            uint32_t& handleOut, uint32_t& information)
+                            uint32_t& handleOut, uint32_t& information,
+                            const GuestStack& site)
     {
         std::string device, relative;
         SplitDevice(guestPath, device, relative);
@@ -316,6 +344,27 @@ namespace
                                    : FILE_OPENED;
         }
         handleOut = InsertHandle(f);
+        if (career_trace::On())
+        {
+            f->mounted = writable;
+            f->guestPath = guestPath;
+            career_trace::Event event;
+            event.op = career_trace::Op::Open;
+            event.path = guestPath;
+            event.to = resolved.string();
+            event.size = f->size;
+            event.handle = handleOut;
+            std::string note = information == FILE_CREATED ? "created"
+                             : information == FILE_SUPERSEDED ? "superseded"
+                             : information == FILE_OVERWRITTEN ? "overwritten"
+                             : "existing";
+            note += f->writable ? ", writable" : ", read-only";
+            if (f->isDirectory) note += ", directory";
+            event.note = note;
+            event.stack = site;
+            event.thread = crash::CurrentThreadName();
+            career_trace::Emit(event);
+        }
         static std::atomic<uint32_t> opens{ 0 };
         if (TraceFiles() || opens++ < 200)
             LOGK("open %s -> %s (%s)", guestPath.c_str(), resolved.string().c_str(),
@@ -357,8 +406,11 @@ PPC_FUNC(__imp__NtCreateFile)
     auto* iosb = GuestPtr<XIoStatusBlock>(ctx.r6.u32);
     const uint32_t options = kernel::StackArgument(ctx, 8);   // CreateOptions
 
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
     uint32_t handle = 0, information = 0;
-    uint32_t status = OpenFileCommon(name, ctx.r4.u32, ctx.r10.u32, options, handle, information);
+    uint32_t status = OpenFileCommon(name, ctx.r4.u32, ctx.r10.u32, options, handle, information,
+                                     site);
     if (handleOut && status == X_STATUS_SUCCESS) *handleOut = handle;
     if (iosb) { iosb->status = status; iosb->information = (status == X_STATUS_SUCCESS) ? information : 0u; }
     ctx.r3.u64 = status;
@@ -370,8 +422,11 @@ PPC_FUNC(__imp__NtOpenFile)
     std::string name = ReadObjectName(ctx.r5.u32);
     auto* iosb = GuestPtr<XIoStatusBlock>(ctx.r6.u32);
 
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
     uint32_t handle = 0, information = 0;
-    uint32_t status = OpenFileCommon(name, ctx.r4.u32, FILE_OPEN, ctx.r8.u32, handle, information);
+    uint32_t status = OpenFileCommon(name, ctx.r4.u32, FILE_OPEN, ctx.r8.u32, handle, information,
+                                     site);
     if (handleOut && status == X_STATUS_SUCCESS) *handleOut = handle;
     if (iosb) { iosb->status = status; iosb->information = (status == X_STATUS_SUCCESS) ? information : 0u; }
     ctx.r3.u64 = status;
@@ -385,6 +440,11 @@ PPC_FUNC(__imp__NtReadFile)
     uint32_t buffer = ctx.r8.u32;
     uint32_t length = ctx.r9.u32;
     uint32_t offsetPtr = ctx.r10.u32;
+
+    // Taken here, not in `transfer`: an asynchronous read is filled at APC
+    // delivery time, on whatever stack the title happened to be alertable on.
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
 
     if (!file || !file->handle || !buffer)
     {
@@ -403,7 +463,7 @@ PPC_FUNC(__imp__NtReadFile)
     // routine, so the buffer is filled at the moment the title is waiting for it
     // rather than while it is still decompressing out of the other half of its
     // double buffer.
-    auto transfer = [file, event, buffer, length, offset, iosb]
+    auto transfer = [file, event, buffer, length, offset, iosb, site]
     {
         std::lock_guard g(file->lock);
         // C requires a positioning call between a write and a read on the same
@@ -439,6 +499,22 @@ PPC_FUNC(__imp__NtReadFile)
                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readFrom).count(),
                            buffer);
         uint32_t status = (got == 0 && length != 0) ? X_STATUS_END_OF_FILE : X_STATUS_SUCCESS;
+        if (file->mounted && career_trace::On())
+        {
+            career_trace::Event event;
+            event.op = career_trace::Op::Read;
+            event.path = file->guestPath.empty() ? file->path.string() : file->guestPath;
+            event.to = file->path.string();
+            event.size = length;
+            event.done = uint32_t(got);
+            event.at = offset >= 0 ? uint64_t(offset) : (position > 0 ? uint64_t(position) : 0);
+            event.note = offset < 0 ? "sequential" : "";
+            event.handle = file->GuestHandle();
+            event.status = status;
+            event.stack = site;
+            event.thread = crash::CurrentThreadName();
+            career_trace::Emit(event);
+        }
         if (iosb) { iosb->status = status; iosb->information = uint32_t(got); }
         if (event) event->Set();
         static std::atomic<uint32_t> reads{ 0 };
@@ -493,6 +569,8 @@ PPC_FUNC(__imp__NtWriteFile)
         return;
     }
 
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
     std::lock_guard g(file->lock);
     const int64_t offset = offsetPtr ? int64_t(uint64_t(*GuestPtr<be64>(offsetPtr))) : -1;
     if (offset >= 0) Seek(file->handle, offset);
@@ -503,6 +581,22 @@ PPC_FUNC(__imp__NtWriteFile)
     if (end > file->size) file->size = end;
 
     const uint32_t status = (put == length) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+    if (file->mounted && career_trace::On())
+    {
+        career_trace::Event event;
+        event.op = career_trace::Op::Write;
+        event.path = file->guestPath.empty() ? file->path.string() : file->guestPath;
+        event.to = file->path.string();
+        event.size = length;
+        event.done = uint32_t(put);
+        event.at = offset >= 0 ? uint64_t(offset) : 0;
+        event.note = offset < 0 ? "sequential" : "";
+        event.handle = file->GuestHandle();
+        event.status = status;
+        event.stack = site;
+        event.thread = crash::CurrentThreadName();
+        career_trace::Emit(event);
+    }
     if (iosb) { iosb->status = status; iosb->information = uint32_t(put); }
     if (event) event->Set();
     if (TraceFiles())
@@ -583,6 +677,8 @@ PPC_FUNC(__imp__NtSetInformationFile)
     auto* iosb = GuestPtr<XIoStatusBlock>(ctx.r4.u32);
     uint32_t buffer = ctx.r5.u32;
     uint32_t infoClass = ctx.r7.u32;
+    const GuestStack site = career_trace::On()
+        ? CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr)) : GuestStack{};
 
     constexpr uint32_t FileRenameInformation = 10;
     constexpr uint32_t FileDispositionInformation = 13;
@@ -605,6 +701,7 @@ PPC_FUNC(__imp__NtSetInformationFile)
         else
         {
             const fs::path target = HostPath(root, relative);
+            const fs::path from = file->path;
             std::error_code ec;
             std::lock_guard g(file->lock);
             if (fs::exists(target, ec) && !replace) status = X_STATUS_OBJECT_NAME_COLLISION;
@@ -614,6 +711,22 @@ PPC_FUNC(__imp__NtSetInformationFile)
                 fs::rename(file->path, target, ec);
                 if (ec) status = 0xC0000022u;
                 else { LOGK("file: renamed %s to %s", file->path.string().c_str(), target.string().c_str()); file->path = target; }
+            }
+            // How a save is published. The two names are worth both being in the
+            // trace: the temporary is the save in progress, the target is the
+            // file the title will find next time.
+            if (file->mounted && career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Rename;
+                event.path = from.string();
+                event.to = target.string();
+                event.note = replace ? "replace" : "no replace";
+                event.handle = file->GuestHandle();
+                event.status = status;
+                event.stack = site;
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
             }
         }
         if (iosb) { iosb->status = status; iosb->information = 0; }
@@ -631,13 +744,39 @@ PPC_FUNC(__imp__NtSetInformationFile)
         else if (infoClass == FileEndOfFileInformation && file->handle && file->writable)
         {
             const uint64_t end = *GuestPtr<be64>(buffer);
+            const uint64_t was = file->size;
             std::fflush(file->handle);
             if (ftruncate(fileno(file->handle), off_t(end)) == 0) file->size = end;
+            if (file->mounted && career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Truncate;
+                event.path = file->guestPath.empty() ? file->path.string() : file->guestPath;
+                event.to = file->path.string();
+                event.size = end;
+                event.handle = file->GuestHandle();
+                event.note = "was " + std::to_string(was);
+                event.stack = site;
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
+            }
         }
         else if (infoClass == FileDispositionInformation)
         {
             // A single byte: non-zero means delete when the last handle closes.
             file->deleteOnClose = file->writable && *GuestPtr<uint8_t>(buffer) != 0;
+            if (file->deleteOnClose && file->mounted && career_trace::On())
+            {
+                career_trace::Event event;
+                event.op = career_trace::Op::Delete;
+                event.path = file->guestPath.empty() ? file->path.string() : file->guestPath;
+                event.to = file->path.string();
+                event.note = "when the handle closes";
+                event.handle = file->GuestHandle();
+                event.stack = site;
+                event.thread = crash::CurrentThreadName();
+                career_trace::Emit(event);
+            }
         }
     }
 
@@ -655,6 +794,18 @@ PPC_FUNC(__imp__NtFlushBuffersFile)
         // kernel and returns; the kernel writes them back when it chooses, so a
         // kill in between loses a save the title was told had landed.
         if (file->handle) kernel::SyncStream(file->handle);
+        if (file->mounted && career_trace::On())
+        {
+            career_trace::Event event;
+            event.op = career_trace::Op::Flush;
+            event.path = file->guestPath.empty() ? file->path.string() : file->guestPath;
+            event.to = file->path.string();
+            event.size = file->size;
+            event.handle = file->GuestHandle();
+            event.stack = CaptureGuestStack(ctx.r1.u32, uint32_t(ctx.lr));
+            event.thread = crash::CurrentThreadName();
+            career_trace::Emit(event);
+        }
     }
     ctx.r3.u64 = X_STATUS_SUCCESS;
 }
