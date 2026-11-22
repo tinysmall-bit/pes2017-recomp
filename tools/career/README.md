@@ -6,8 +6,9 @@ a device. Nothing here ships a game file, and nothing here claims a field it has
 not seen.
 
 Status: **research tooling and analysis only.** No editor is implemented, because
-no career field has yet been located in real data. That is deliberate — see
-"Rules" at the bottom.
+no career field has yet been located in real data. E1 and E2 are instrumented and
+written up in §4, but neither has been run on hardware yet, and no offset below is
+claimed. That is deliberate — see "Rules" at the bottom.
 
 ---
 
@@ -133,16 +134,68 @@ reads (`config/pes_symbols.txt`), so from then on every tool prints
 It reuses `tools/title.py`'s own section and `.pdata` reader rather than a second
 parser, so it sees the image the same way the recompiler's tooling does.
 
-### `test_career_tools.py`
+### `trace_report.py` — read the trace, get E1's answer
 
 ```bash
-python3 tools/career/test_career_tools.py
+tools/career/trace_report.py reports/career/e1/master-league.log
+tools/career/trace_report.py --timeline reports/career/e1/*.log
+adb logcat -d | tools/career/trace_report.py -
 ```
 
-Builds a synthetic flat PE (a `lis`/`addi` reference to a string, two `.pdata`
-functions) and a `saves/` folder holding two copies of a career differing in one
-32-bit word, then asserts what the tools report. 15 checks, all passing; an
-analyser that has never been run is not evidence.
+Groups the `career` lines into the sessions between a `mount` and its `unmount`
+and prints, per session: the package, the drive, the mount's flags and note, how
+many operations of each kind, bytes read and written, every `open` with its size
+and note, the guest stacks that made the calls, any `rename` (a save being
+published), and the unmount time. Then a rollup of the packages *in mount order*,
+which is the identification: one mode per capture, and the package it mounted is
+that mode's save.
+
+It is deliberately fussy about the three ways a trace is misread: a session with
+no `unmount` is reported as open-ended rather than as a short session; a non-zero
+`status` is counted and shown instead of hidden (the title probing for a file it
+does not have is `0xC0000034`, not a failure); and a `stop` line — the 250,000
+event cap — is called out, because the log is then not the whole run.
+
+### `save_layout.py` — is the file plain, and is there a checksum?
+
+```bash
+tools/career/save_layout.py survey    savegame.svg
+tools/career/save_layout.py checksums savegame.svg
+```
+
+`survey` answers the question that decides whether a field editor is even
+possible: entropy per block, zeros, surviving ASCII runs, and a record-stride scan.
+A save that is deflate-compressed or encrypted is dense and flat (≈8 bits/byte, no
+ASCII) and **cannot** be patched by offset at all — the editor would have to work
+on the title's live structure instead. The stride scan reports how often a 2-byte
+pair repeats at each stride against the median over every stride tried, which is
+what chance looks like in that file; a peak says a fixed-size record repeats, and
+says nothing about where a record begins or which offset is which field.
+
+`checksums` takes the plausible places for an integrity value (the last word, the
+last two, the first dwords of a header) and asks whether any equals crc32,
+adler32, a byte sum or a word xor of some other range of the same file — including
+the file with that word zeroed. It prints every attempt and its negative result:
+"no match" is **not** "no checksum". A match is a candidate, and only the title's
+behaviour confirms it.
+
+### The tool checks
+
+```bash
+python3 tools/career/test_career_tools.py       # 15 checks
+python3 tools/career/test_career_analysis.py    # 24 checks
+```
+
+The first builds a synthetic flat PE (a `lis`/`addi` reference to a string, two
+`.pdata` functions) and a `saves/` folder holding two copies of a career differing
+in one 32-bit word, then asserts what the probe and the map report. The second
+builds a `career` log in the emitter's exact format (two mount sessions, a failed
+open, a truncated one, the cap) and a save-like file with a 0x40 record stride and
+a trailing CRC32, then asserts what the report and the layout survey say. An
+analyser that has never been run is not evidence — but neither is an analyser run
+only on its own fixture: `tests/career_trace_test.cpp` pins the line format, and
+the report is checked against a log written by the real `career_trace::Emit`, not
+by a copy of its format.
 
 ---
 
@@ -201,19 +254,14 @@ paths, sizes, offsets and statuses), it has no way to write to one, and it is of
 by default — with it off, every hook is one cached `bool` and a branch, and
 nothing is formatted or logged.
 
-### Reading the log, which is experiment E1
+### Reading the log
 
-1. Start with tracing on and go straight to *Master League → Load*. The first
-   `mount` line names the package (`to=saves/<name>`); every operation until the
-   `unmount` is that career being read.
-2. Back to the menu (`unmount`), then *Become a Legend → Load*. Its `mount` names
-   the other package. If both modes mount the **same** package, that is a finding
-   too: one container for both changes what an editor has to select.
-3. `tools/career/save_probe.py list saves/` records both packages' files, sizes
-   and hashes next to the trace.
-4. The `stack` addresses are the save-and-load code. Name them with
-   `tools/title.py` once `xex_career_map.py --symbols-out config/pes_symbols.txt`
-   has run on your own `default.xex`, then grep the names in the generated tree.
+The commands that produce one of these logs are E1's, in §4; this is what the lines
+mean in sequence. A `mount` line names the package (`to=saves/<name>`), and every
+operation until the `unmount` is that career being touched. The `stack` addresses are
+the save-and-load code: name them with `tools/title.py` once `xex_career_map.py
+--symbols-out config/pes_symbols.txt` has run on your own `default.xex`, then grep
+the names in the generated tree.
 
 A save — a match played or a week advanced, then *Save* — shows up as `open …
 note=created, writable`, a run of `write`s, `flush`, then `rename` from the
@@ -233,22 +281,175 @@ line corresponds to a real save: that is E1, on your hardware.
 
 ---
 
-## 4. The experiments that need the device
+## 4. Running E1 and E2 on the device
 
-Each is small, and each names what it settles. Use disposable copies of careers —
-never the only save.
+Each experiment is small and each names what it settles. Both of the first two are
+**read-only, and neither pushes anything back to the phone**: E1 switches the trace
+on and reads the log, and E2 changes something through the game's own menus and
+lets PES save it. Not one byte is sent to the device.
 
-**E1 — which package is which career.** Run with `PES17_TRACE_CAREER=1` (see §3
-for the phone), enter *Master League → Load*, and note the `mount` line's `to=`
-and every operation after it; repeat for *Become a Legend*. `tools/career/save_probe.py
-list` then records the folder. Settles "identify the active career without
-touching unrelated data". No file is modified.
+Before starting:
 
-**E2 — the serialized layout, by cause.** Copy one career twice. Change exactly one
-thing in the game (advance a week; play a match so the budget moves a known
-amount), save with PES's own save, quit. `diff` the copies. Every moved byte is now
-attributable. Repeat with a second, orthogonal change to separate fields that move
-together. This is how the offset gets established — never by assuming a stride.
+- **Take one full backup**, and do it while the game is stopped: Settings › Game
+  files › Back up, or the `adb pull` in E1 step 1. Everything afterwards works on
+  copies of what you pull; the phone's `saves/` stays the original.
+- **Captures live under `reports/`**, which is gitignored. A save is private data,
+  and a trace names its packages: neither belongs in a commit.
+
+Where the files are, from the app's own code (`SaveBackup.savesDir`, `LogSummary`):
+
+| what | path |
+|---|---|
+| `saves/` | beside the game folder — `…/files/saves/` for the default one; a directory per package, `<name>.bak` for the previous save a rotation kept aside |
+| the log the trace goes to | the app's own folder, `files/game.log`, and logcat |
+
+The paths below use `…/files/saves` for the first; substitute yours if the game
+folder was moved. `P=com.pes2017.recomp` keeps the commands readable.
+
+### E1 — which package is which career
+
+```bash
+P=com.pes2017.recomp
+mkdir -p reports/career/e1
+
+# 1. the saves as they are now (the backup this experiment needs, since it changes nothing)
+adb pull /sdcard/Android/data/$P/files/saves reports/career/e1/saves-before
+python3 tools/career/save_probe.py list reports/career/e1/saves-before
+
+# 2. switch the trace on without a rebuild, and drop the previous log
+adb shell run-as $P touch files/career_trace
+adb shell run-as $P rm -f files/game.log
+
+# 3. start the game. Go straight to Master League > Load, open a career, back out to the
+#    menu, and stop the game. Nothing else — the first mount line should be that career.
+
+# 4. the log, and the answer
+adb shell run-as $P cat files/game.log > reports/career/e1/master-league.log
+python3 tools/career/trace_report.py reports/career/e1/master-league.log
+#    if game.log came back empty, the lines are on logcat instead:
+adb logcat -d | python3 tools/career/trace_report.py -
+
+# 5. the same for Become a Legend
+adb shell run-as $P rm -f files/game.log
+#    ... Become a Legend > Load, open a career, back out, stop ...
+adb shell run-as $P cat files/game.log > reports/career/e1/become-a-legend.log
+python3 tools/career/trace_report.py --timeline reports/career/e1/*.log
+```
+
+What the report settles, and how to read it:
+
+- **One `mount` line, one package.** The `to=` value is that mode's save: for the
+  session between the `mount` and its `unmount`, every `open`/`read`/`write` is
+  that career being touched. `--timeline` over both logs shows the two packages in
+  the order you mounted them, which is the whole identification.
+- **Both modes on the same package** is also a finding, and it changes the plan:
+  one container holds both, so an editor selects a career *inside* a package
+  rather than picking a package per mode. Record it; do not force two names.
+- The `stack` on the `mount` line is the load code. `xex_career_map.py
+  --symbols-out config/pes_symbols.txt` on your own `default.xex` makes
+  `tools/title.py` print those addresses as names.
+- An `open … status=0xC0000034` is `STATUS_OBJECT_NAME_NOT_FOUND`: the title
+  looking for a file it does not have. Record it and move on.
+- Write down the `size=` on the `open` of `savegame.svg`. It is the length of one
+  career's data, and it is the first thing E2's diff has to agree with.
+
+`trace_report.py` warns when a session never ended, when an operation returned a
+non-zero status, and when the 250,000-event cap was hit — a capped log is not the
+whole run and must not be read as one.
+
+### E2 — the layout, by cause
+
+One change per capture, and a capture both before and after it.
+
+```bash
+P=com.pes2017.recomp
+mkdir -p reports/career/e2-change-one
+adb pull /sdcard/Android/data/$P/files/saves reports/career/e2-change-one/saves-before
+```
+
+Then, in the game, make **exactly one** change whose value you can read on screen —
+that is what makes the moved bytes attributable:
+
+- a Master League budget on the club screen, if it shows the number;
+- a Become a Legend player's skill points or rating;
+- or, crudest and most useful for a first pass, **advance one week with no match**:
+  it moves a date and a counter and little else.
+
+Save with **PES's own save** (do not copy anything into `saves/` by hand), quit the
+game completely, then:
+
+```bash
+adb pull /sdcard/Android/data/$P/files/saves reports/career/e2-change-one/saves-after
+python3 tools/career/save_probe.py diff \
+    reports/career/e2-change-one/saves-before/<package>/savegame.svg \
+    reports/career/e2-change-one/saves-after/<package>/savegame.svg \
+  | tee reports/career/e2-change-one/diff.txt
+```
+
+Read the diff for four different things:
+
+1. **The offsets that moved**, as runs, with the enclosing word in both byte orders.
+   A budget of 500,000 → 999,999 moves three bytes inside one big-endian word and
+   nothing else; that shape is the finding, and it must be reported with both values,
+   not just the offset.
+2. **Everything else in the same package that moved**, and what it looks like: a
+   plausible checksum near the start or the end of the file is the next thing to
+   investigate, not a nuisance.
+3. **Whether the file changed length** (`diff` says so), which would mean the save is
+   variable-length or has slack in it — a fixed offset then needs the record's start
+   known, not just the field's.
+4. **Whether another package was written.** The trace answers this directly: run the
+   save with `files/career_trace` in place and `trace_report.py` lists every mount.
+   A career save that also rewrites the profile or the system data is a dependency any
+   editor has to respect, and this is the experiment that proves it rather than
+   assuming it.
+
+A second run with a different, orthogonal change is what separates fields that always
+move together (a date and its counter; a value and a total) from the one you meant to
+change. Bytes that move in *both* runs are shared state and must not be treated as the
+field.
+
+### Integrity, before any write is proposed
+
+```bash
+python3 tools/career/save_layout.py survey    reports/career/e2-change-one/saves-after/<package>/savegame.svg
+python3 tools/career/save_layout.py checksums reports/career/e2-change-one/saves-after/<package>/savegame.svg
+```
+
+- `survey` decides whether a field editor is possible at all. Dense, flat data with no
+  ASCII runs is compressed or encrypted: then no offset patch means anything, and the
+  editor must work on the title's live structure. A visible record stride and surviving
+  text is the opposite, and says the save is plain.
+- `checksums` reports a **candidate**, never a proof. The proof is the title's own
+  behaviour, and getting it needs a write: change one byte that is not the candidate
+  checksum in a *copy pulled from the device*, put that copy back on a disposable slot,
+  and see whether the game loads it. That is E3's territory, not E1/E2's, and it is
+  recorded as "the title rejected a save whose check word did not match" only if it
+  actually did.
+- Two failures worth distinguishing and reporting exactly: a copy the title **refuses
+  to load** (the check is on load), and a copy the title loads but that is **replaced
+  by the unmodified one on the next save** (the check is on save, or the live structure
+  won — see §1.2).
+
+### What the offsets record looks like
+
+No row may be added until E2 and E3 agree and the game has shown the value back. The
+record is the evidence, not the conclusion — paste it into an issue or a note:
+
+| offset | width | byte order | field | evidence | shown back in game |
+|---|---|---|---|---|---|
+| *(none yet — no career save has been read on a device)* | | | | | |
+
+```
+E2 change: <what you did, and the value on screen before/after>
+file:      saves/<package>/savegame.svg   <size> -> <size>
+package mounted for the save (from the trace): <to=>
+moved:     <offset> <length>   A=<hex>  B=<hex>   word: A=<be/le>  B=<be/le>
+unchanged but suspicious: <offsets that look like a counter, checksum, date>
+other packages written: <none | names>
+```
+
+### E3 to E6, still ahead
 
 **E3 — width, scale and range.** For each candidate: write it in a *copy*, load it,
 and check the number the game shows. Then bisect the valid range (0, 1, mid, huge)
@@ -270,7 +471,7 @@ screen** → confirm a second career, the edit data and the system data still lo
 `.bak` rename-back recovers a whole save. Report the observed behaviour; do not
 claim atomicity that was not observed.
 
-A device note: `PES17_WINDOW=0` runs the title headless (useful for scripted
+A device note for the later experiments: `PES17_WINDOW=0` runs the title headless (useful for scripted
 tracing), `PES17_FPS_LIMIT` and `PES17_NO_AUDIO` reduce heat, and
 `PES17_INPUT_SCRIPT` presses pad buttons at wall-clock seconds, so E1 and E2 can be
 driven without a human at the screen.

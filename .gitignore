@@ -53,6 +53,10 @@ __pycache__/
 
 # ---- saved games the runtime writes beside the binary ----
 /saves/
+# ---- E1/E2 captures: pulled logs, and copies of the user's saves ----
+# A save is private data and a career trace names its packages. Neither is
+# committed; the runbook in tools/career/README.md writes them here.
+/reports/
 
 # ---- the Android app's build output ----
 android/build/
