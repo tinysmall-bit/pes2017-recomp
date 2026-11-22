@@ -19,6 +19,10 @@ val repositoryRoot = file("../..")
 //   PES17_NATIVE_OPTIMISATION  -O2 compiles the recompiled tree a good deal
 //                          quicker than -O3 and runs within a few percent of
 //                          it; a runner with six hours cares about that
+//   PES17_DIAGNOSTICS        ON to keep the diagnostic switches. The career
+//                          trace is one of them (career_trace::On() asks
+//                          diag::kOn), so a trace build sets this and an
+//                          ordinary build leaves it OFF
 //   PES17_COMPILER_LAUNCHER  ccache, usually
 //   PES17_XEX_SHA256_SP/MP   the hashes the installer checks a player's own
 //                          copy against, for a build that has the recompiled
@@ -87,7 +91,11 @@ android {
                     "-DANDROID_STL=c++_shared",
                     // The runtime's optional parts, all off: they cost frames
                     // and the phone has none to spare.
-                    "-DPES17_DIAGNOSTICS=OFF",
+                    // The career trace is compiled out of a build without
+                    // diagnostics: career_trace::On() is `diag::kOn && ...` and
+                    // kOn is 0 here. A trace APK therefore sets
+                    // PES17_DIAGNOSTICS=ON; releases keep the default.
+                    "-DPES17_DIAGNOSTICS=${setting("PES17_DIAGNOSTICS") ?: "OFF"}",
                     "-DPES17_USE_SDL=OFF",
                     "-DPES17_LOGGING=ON",
                     "-DCMAKE_BUILD_TYPE=Release",

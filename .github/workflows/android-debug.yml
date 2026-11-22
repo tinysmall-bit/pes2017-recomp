@@ -1,0 +1,304 @@
+# Android debug APK with the career trace (PES 2017, Xbox 360 -> arm64).
+#
+# Why a self-hosted runner: the build's input is your own retail default.xex.
+# It has to stay on your machine, so nothing here commits it, caches it as an
+# artifact, or uploads it. The job reads it from a folder OUTSIDE the checkout
+# and refuses to run if that folder is inside the workspace.
+#
+# Set the runner up once (Settings > Actions > Runners, "New self-hosted runner"):
+#   * Linux x64 host with JDK 17+, Android SDK (platform 35 + build-tools),
+#     NDK 28.2.13676358, cmake 3.22.1+, ninja, clang, python3 3.10+, git, unzip
+#   * ANDROID_HOME set to the SDK, with the NDK in $ANDROID_HOME/ndk (or
+#     ANDROID_NDK_HOME set for the runner service), and JDK 17 on PATH
+#   * labels self-hosted, linux, x64 -- or set the repository variable
+#     PES17_RUNNER to a JSON array of whatever labels you gave it
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   PES17_GAME        folder holding default.xex, outside the repo (default /srv/pes17)
+#   PES17_XEX_SHA256  only when your dump is not the one the app already expects
+#                     (b914ec9a1abb3a9b42a64255b6aa8ff27312da126f7c18f8c880106b832779e6)
+#   PES17_JOBS        parallel compile jobs (default: every core)
+#   PES17_RUNNER      JSON label array, default ["self-hosted","linux","x64"]
+#
+# Two stages on purpose: build.sh generates ppc/ from the xex and
+# RECOMPILE_ONLY=1 stops before its own native build; Gradle then runs the one
+# native build whose libpes17.so is packaged, so the checks afterwards read
+# exactly the library that is in the APK. Compiling it twice would waste an
+# hour and could verify a different binary from the shipped one.
+#
+# The trace needs a diagnostics build: career_trace::On() is `diag::kOn && ...`
+# (runtime/kernel/career_trace.cpp), so with -DPES17_DIAGNOSTICS=OFF the switch
+# is compiled out and setting PES17_TRACE_CAREER does nothing. This job builds
+# with PES17_DIAGNOSTICS=ON, which is why the APK it makes is for tracing and
+# not a performance build.
+name: Android debug APK (career trace)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix1]
+    paths-ignore:
+      - 'docs/**'
+      - 'release/**'
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  apk:
+    runs-on: ${{ fromJSON(vars.PES17_RUNNER || '["self-hosted","linux","x64"]') }}
+    timeout-minutes: 360
+    env:
+      PES17_GAME: ${{ vars.PES17_GAME || '/srv/pes17' }}
+      EXPECTED_XEX_SHA: ${{ vars.PES17_XEX_SHA256 || 'b914ec9a1abb3a9b42a64255b6aa8ff27312da126f7c18f8c880106b832779e6' }}
+      PES17_JOBS: ${{ vars.PES17_JOBS || '' }}
+      PROFILE: balanced
+
+    steps:
+      - name: Check out fix1
+        uses: actions/checkout@v4
+        with:
+          ref: fix1
+          fetch-depth: 0
+          clean: true
+
+      - name: Check the runner and the game file
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          xex="$PES17_GAME/default.xex"
+          [ -f "$xex" ] || fail "No $xex. Put your own default.xex there or set the PES17_GAME repository variable."
+
+          ws=$(cd "$GITHUB_WORKSPACE" && pwd -P)
+          xp=$(cd "$(dirname "$xex")" && pwd -P)
+          if [[ "$xp" == "$ws" || "$xp" == "$ws"/* ]]; then
+            fail "PES17_GAME must be outside the checkout ($xp is inside $ws)."
+          fi
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha() { sha256sum "$1" | cut -d' ' -f1; }
+          else
+            sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          fi
+
+          got=$(sha "$xex")
+          echo "default.xex: $xex"
+          echo "SHA-256:     $got"
+          if [ "$got" != "$EXPECTED_XEX_SHA" ]; then
+            fail "default.xex is $got, expected $EXPECTED_XEX_SHA. If this really is the copy the APK should install, set the PES17_XEX_SHA256 repository variable."
+          fi
+
+          for t in git cmake ninja python3 unzip java; do
+            command -v "$t" >/dev/null 2>&1 || fail "$t is not on PATH on this runner."
+          done
+
+          clang_bin=${CMAKE_CC:-/usr/bin/clang}
+          if [ ! -x "$clang_bin" ]; then clang_bin=$(command -v clang || true); fi
+          [ -n "$clang_bin" ] && [ -x "$clang_bin" ] || fail "clang is not available (or set CMAKE_CC for the runner)."
+          cxx_bin=${CMAKE_CXX:-}
+          if [ -z "$cxx_bin" ]; then
+            if [ "$clang_bin" = /usr/bin/clang ] && [ -x /usr/bin/clang++ ]; then
+              cxx_bin=/usr/bin/clang++
+            else
+              cxx_bin=$(command -v clang++ || true)
+            fi
+          fi
+          [ -n "$cxx_bin" ] && [ -x "$cxx_bin" ] || fail "clang++ is not available (or set CMAKE_CXX for the runner)."
+
+          jv=$(java -version 2>&1 | awk -F'"' '/version/ { print $2; exit }')
+          jmaj=$(printf '%s' "${jv:-0}" | awk -F. '{ print ($1 == "1") ? $2 : $1 }')
+          [ "${jmaj:-0}" -ge 17 ] 2>/dev/null || fail "JDK 17+ is required; java is '${jv:-missing}' (AGP 8.7 / Gradle 8.11)."
+
+          sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}
+          [ -n "$sdk" ] && [ -d "$sdk" ] || fail "ANDROID_HOME (or ANDROID_SDK_ROOT) is not set to an Android SDK on this runner."
+
+          ndk=${ANDROID_NDK_HOME:-}
+          if [ -z "$ndk" ]; then ndk=$(ls -d "$sdk"/ndk/28.* 2>/dev/null | tail -1 || true); fi
+          [ -n "$ndk" ] && [ -d "$ndk" ] || fail "No NDK 28.x under $sdk/ndk. Install NDK 28.2.13676358 or set ANDROID_NDK_HOME."
+
+          if command -v ccache >/dev/null 2>&1; then
+            echo "ccache: $(ccache --version | head -1)"
+          else
+            echo "ccache: not installed; later runs will not reuse compiled units"
+          fi
+
+          {
+            echo "ANDROID_HOME=$sdk"
+            echo "ANDROID_SDK_ROOT=$sdk"
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "CMAKE_CC=$clang_bin"
+            echo "CMAKE_CXX=$cxx_bin"
+            echo "PES17_BUILD_SHA=$(git rev-parse --short HEAD)"
+            echo "PES17_BUILD_STAMP=$(date -u +%Y%m%dT%H%M%SZ)"
+            echo "JOBS=${PES17_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
+          } >> "$GITHUB_ENV"
+
+          echo "SDK: $sdk"
+          echo "NDK: $ndk"
+          echo "APK will be: android/app/build/outputs/apk/debug/app-debug.apk"
+
+      - name: Check the three career commits are in HEAD
+        run: |
+          set -euo pipefail
+          echo "HEAD: $(git rev-parse HEAD)"
+          for c in 29fd9ca 70eabb6 76b0255; do
+            git cat-file -e "${c}^{commit}" 2>/dev/null || { echo "::error::commit $c is not in this clone"; exit 1; }
+            git merge-base --is-ancestor "$c" HEAD || { echo "::error::commit $c is not an ancestor of HEAD"; exit 1; }
+            echo "ok: $(git log -1 --format='%h %s' "$c")"
+          done
+
+      - name: Cache the host tools, ccache and Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            third_party/XenonRecomp/build
+            pes/default.pe
+          key: pes17-${{ runner.os }}-${{ env.EXPECTED_XEX_SHA }}-${{ hashFiles('build.sh', 'config/PES.toml', 'config/pes_switch_extra.toml', 'CMakeLists.txt', 'android/app/build.gradle.kts', 'third_party/XenonRecomp/CMakeLists.txt') }}
+          restore-keys: |
+            pes17-${{ runner.os }}-${{ env.EXPECTED_XEX_SHA }}-
+
+      - name: Generate ppc/ from default.xex
+        run: |
+          set -euo pipefail
+          chmod +x build.sh tools/verify_android_libs.sh
+          CCACHE=1 RECOMPILE_ONLY=1 GAME="$PES17_GAME" ./build.sh
+          echo "ppc/: $(ls ppc | wc -l) files"
+          ls ppc/ppc_recomp.*.cpp >/dev/null 2>&1 || { echo "::error::ppc/ has no recompiled units"; exit 1; }
+          [ -f ppc/stubs_generated.cpp ] || { echo "::error::ppc/stubs_generated.cpp is missing"; exit 1; }
+          ls -la ppc/PROFILE pes/default.xex
+
+      - name: Career-trace checks (no disc, no device)
+        run: |
+          set -euo pipefail
+          cmake -S tests -B build-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests --target career-trace-test -j"$JOBS"
+          ctest --test-dir build-tests -R '^career-trace$' --output-on-failure
+          python3 tools/career/test_career_tools.py
+          python3 tools/career/test_career_analysis.py
+
+      - name: Build libpes17.so and app-debug.apk
+        run: |
+          set -euo pipefail
+          chmod +x android/gradlew
+          # The trace is compiled out without diagnostics (see the header comment).
+          export PES17_DIAGNOSTICS=ON
+          # -O2 compiles the recompiled tree noticeably faster than -O3 and runs
+          # within a few percent of it (android/app/build.gradle.kts).
+          export PES17_NATIVE_OPTIMISATION=-O2
+          if command -v ccache >/dev/null 2>&1; then
+            export PES17_COMPILER_LAUNCHER=ccache
+          fi
+          cd android
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify the APK
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          [ -f "$apk" ] || fail "Gradle produced no $apk"
+          ls -la "$apk"
+
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libpes17\.so' || fail "the APK has no lib/arm64-v8a/libpes17.so"
+
+          rm -rf verify-apk && mkdir -p verify-apk
+          unzip -q "$apk" 'lib/arm64-v8a/*' -d verify-apk
+          lib=verify-apk/lib/arm64-v8a/libpes17.so
+          size=$(wc -c < "$lib")
+          echo "libpes17.so: $size bytes"
+          # The recompiled guest code is tens of megabytes; a placeholder is not.
+          [ "$size" -gt 20000000 ] || fail "libpes17.so is only $size bytes -- that is not the recompiled runtime"
+
+          # 16 KB page alignment of the library and of its zip entries.
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          tools/verify_android_libs.sh "$lib" "$apk"
+
+          # The trace must be in the shipped library, not only in the source tree.
+          grep -a -q 'PES17_TRACE_CAREER' "$lib" || fail "the career trace switch is not in libpes17.so (built without diagnostics?)"
+          grep -a -q 'career %lld %s' "$lib" || fail "the career trace formatter is not in libpes17.so"
+
+          cache=$(find android/app/.cxx -name CMakeCache.txt -exec grep -l 'PES17_DIAGNOSTICS:BOOL=ON' {} + 2>/dev/null | head -1 || true)
+          if [ -n "$cache" ]; then
+            echo "diagnostics: ON ($cache)"
+          else
+            echo "::warning::No CMakeCache with PES17_DIAGNOSTICS:BOOL=ON found under android/app/.cxx; the string checks above are the evidence."
+          fi
+
+          buildtools=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | tail -1 || true)
+          if [ -n "$buildtools" ] && [ -x "$buildtools/aapt2" ]; then
+            "$buildtools/aapt2" dump badging "$apk" | head -3
+            "$buildtools/aapt2" dump badging "$apk" | grep -Fq "($PES17_BUILD_SHA" \
+              || fail "versionName does not carry the build sha ($PES17_BUILD_SHA)"
+          fi
+          if [ -n "$buildtools" ] && [ -x "$buildtools/apksigner" ]; then
+            "$buildtools/apksigner" verify --print-certs "$apk" | head -8
+          fi
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            apk_sha=$(sha256sum "$apk" | cut -d' ' -f1)
+          else
+            apk_sha=$(shasum -a 256 "$apk" | cut -d' ' -f1)
+          fi
+
+          mkdir -p build-info
+          {
+            echo "PES 2017 Android debug APK -- career trace build"
+            echo "commit:       $(git rev-parse HEAD)  ($(git rev-parse --abbrev-ref HEAD))"
+            echo "career:       29fd9ca 70eabb6 76b0255 (all ancestors of HEAD)"
+            echo "default.xex:  $EXPECTED_XEX_SHA"
+            echo "diagnostics:  ON -- required for PES17_TRACE_CAREER"
+            echo "apk:          $apk ($(wc -c < "$apk") bytes)"
+            echo "apk sha256:   $apk_sha"
+            echo "libpes17.so:  $size bytes"
+            echo "trace:        PES17_TRACE_CAREER and 'career %lld %s' found in the packaged library"
+            echo "install:      adb install -r $apk"
+            echo "              (debug key: a fresh device, or uninstall first -- uninstalling"
+            echo "               deletes Android/data/com.pes2017.recomp, game files and saves)"
+            echo "trace on:     adb shell \"echo 1 > /sdcard/Android/data/com.pes2017.recomp/files/career_trace\""
+            echo "trace off:    adb shell rm /sdcard/Android/data/com.pes2017.recomp/files/career_trace"
+            echo "log:          adb pull /sdcard/Android/data/com.pes2017.recomp/files/game.log"
+          } | tee build-info/apk-info.txt
+
+          {
+            echo "### app-debug.apk"
+            echo ""
+            echo '```'
+            cat build-info/apk-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes17-app-debug-${{ github.run_number }}
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            build-info/apk-info.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes17-build-logs-${{ github.run_number }}
+          path: |
+            logs-analyse.txt
+            logs-recomp.txt
+            logs-cmake.txt
+          if-no-files-found: ignore
+          retention-days: 7
